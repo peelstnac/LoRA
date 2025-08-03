@@ -7,7 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
-from typing import Optional, List
+from typing import Optional, Any, List
+
+from torch import Tensor
+from jaxtyping import Float, Bool, jaxtyped
+from beartype import beartype
+
 
 class LoRALayer():
     def __init__(
@@ -98,6 +103,7 @@ class Linear(nn.Linear, LoRALayer):
         lora_dropout: float = 0.,
         fan_in_fan_out: bool = False, # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         merge_weights: bool = True,
+        freeze_pretrained_weight_matrix: bool = True,
         **kwargs
     ):
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
@@ -111,7 +117,9 @@ class Linear(nn.Linear, LoRALayer):
             self.lora_B = nn.Parameter(self.weight.new_zeros((out_features, r)))
             self.scaling = self.lora_alpha / self.r
             # Freezing the pre-trained weight matrix
-            self.weight.requires_grad = False
+            # no clue why this is here, so we add a flag to disable
+            if freeze_pretrained_weight_matrix:
+                self.weight.requires_grad = False
         self.reset_parameters()
         if fan_in_fan_out:
             self.weight.data = self.weight.data.transpose(0, 1)
@@ -141,13 +149,28 @@ class Linear(nn.Linear, LoRALayer):
                     self.weight.data += T(self.lora_B @ self.lora_A) * self.scaling
                 self.merged = True       
 
-    def forward(self, x: torch.Tensor):
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "*#batch D"], mask: Optional[Bool[Tensor, "*#batch"]] = None):
+        """
+        Parameters:
+            x: Input tensor
+            mask: Provide to apply LoRA weights to a masked region of x
+        """
+        if mask is not None:
+            assert not self.merge_weights, "self.merge_weights should be False if mask is provided"
+            assert not self.merged, "self.merged should be False if mask is provided"
+
         def T(w):
             return w.transpose(0, 1) if self.fan_in_fan_out else w
         if self.r > 0 and not self.merged:
-            result = F.linear(x, T(self.weight), bias=self.bias)            
-            result += (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
-            return result
+            if mask is None:
+                result = F.linear(x, T(self.weight), bias=self.bias)            
+                result += (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
+                return result
+            else:
+                result = F.linear(x, T(self.weight), bias=self.bias)            
+                result[mask] += ((self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling)[mask]
+                return result
         else:
             return F.linear(x, T(self.weight), bias=self.bias)
 
@@ -164,6 +187,7 @@ class MergedLinear(nn.Linear, LoRALayer):
         enable_lora: List[bool] = [False],
         fan_in_fan_out: bool = False,
         merge_weights: bool = True,
+        freeze_pretrained_weight_matrix: bool = True,
         **kwargs
     ):
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
@@ -182,7 +206,9 @@ class MergedLinear(nn.Linear, LoRALayer):
             ) # weights for Conv1D with groups=sum(enable_lora)
             self.scaling = self.lora_alpha / self.r
             # Freezing the pre-trained weight matrix
-            self.weight.requires_grad = False
+            # no clue why this is here, so we add a flag to disable
+            if freeze_pretrained_weight_matrix:
+                self.weight.requires_grad = False
             # Compute the indices
             self.lora_ind = self.weight.new_zeros(
                 (out_features, ), dtype=torch.bool
@@ -232,7 +258,12 @@ class MergedLinear(nn.Linear, LoRALayer):
                     self.weight.data += self.merge_AB() * self.scaling
                 self.merged = True        
 
-    def forward(self, x: torch.Tensor):
+    @jaxtyped(typechecker=beartype)
+    def forward(self, x: Float[Tensor, "*#batch D"], mask: Optional[Bool[Tensor, "*#batch"]] = None):
+        if mask is not None:
+            assert not self.merge_weights, "self.merge_weights should be False if mask is provided"
+            assert not self.merged, "self.merged should be False if mask is provided"
+
         def T(w):
             return w.transpose(0, 1) if self.fan_in_fan_out else w
         if self.merged:
@@ -240,7 +271,10 @@ class MergedLinear(nn.Linear, LoRALayer):
         else:
             result = F.linear(x, T(self.weight), bias=self.bias)
             if self.r > 0:
-                result += self.lora_dropout(x) @ T(self.merge_AB().T) * self.scaling
+                if mask is None:
+                    result += self.lora_dropout(x) @ T(self.merge_AB().T) * self.scaling
+                else:
+                    result[mask] += (self.lora_dropout(x) @ T(self.merge_AB().T) * self.scaling)[mask]
             return result
 
 class ConvLoRA(nn.Module, LoRALayer):
